@@ -1,0 +1,414 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <math.h>
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+#define NUM_TOPICS        7
+#define MAX_HISTORY      100
+#define MAX_RESOURCES    600
+#define MAX_PATH_STEPS     4
+#define MAX_RES_PER_STEP   3
+#define TARGET_MASTERY   0.85
+#define PREREQ_THRESHOLD 0.60
+
+typedef enum { STYLE_VISUAL, STYLE_READING, STYLE_AUDITORY, STYLE_KINESTHETIC, STYLE_ANY, NUM_STYLES } LearningStyle;
+typedef enum { TYPE_VIDEO, TYPE_ARTICLE, TYPE_INTERACTIVE, TYPE_QUIZ } ResourceType;
+typedef enum { PACE_SLOW, PACE_MEDIUM, PACE_FAST } Pace;
+
+static const char *TOPIC_NAMES[NUM_TOPICS] = {
+    "Arithmetic", "Fractions", "Algebra Basics", "Linear Equations",
+    "Geometry", "Statistics", "Trigonometry"
+};
+
+static const int PREREQS[NUM_TOPICS][2] = {
+     {-1, -1},
+     { 0, -1},
+     { 1, -1},
+     { 2, -1},
+     { 0, -1},
+     { 1, -1},
+     { 4,  2}
+};
+
+static const char *STYLE_NAMES[NUM_STYLES] = {"visual", "reading", "auditory", "kinesthetic", "any"};
+static const char *TYPE_NAMES[4] = {"video", "article", "interactive", "quiz"};
+
+typedef struct {
+    int id;
+    int topic;
+    int difficulty;
+    LearningStyle style;
+    ResourceType r_type;
+    int duration_min;
+} Resource;
+
+static Resource CATALOG[MAX_RESOURCES];
+static int CATALOG_SIZE = 0;
+
+static void build_catalog(void) {
+    int id = 1;
+    LearningStyle content_styles[4] = {STYLE_VISUAL, STYLE_READING, STYLE_AUDITORY, STYLE_KINESTHETIC};
+    ResourceType   style_to_type[4]  = {TYPE_VIDEO,  TYPE_ARTICLE, TYPE_VIDEO,     TYPE_INTERACTIVE};
+    int durations[4] = {10, 15, 20, 30};
+
+    for (int t = 0; t < NUM_TOPICS; t++) {
+        for (int diff = 1; diff <= 5; diff++) {
+            for (int s = 0; s < 4; s++) {
+                Resource r;
+                r.id = id++;
+                r.topic = t;
+                r.difficulty = diff;
+                r.style = content_styles[s];
+                r.r_type = style_to_type[s];
+                r.duration_min = durations[rand() % 4];
+                CATALOG[CATALOG_SIZE++] = r;
+            }
+        }
+
+        for (int diff = 1; diff <= 5; diff++) {
+            Resource r;
+            r.id = id++;
+            r.topic = t;
+            r.difficulty = diff;
+            r.style = STYLE_ANY;
+            r.r_type = TYPE_QUIZ;
+            r.duration_min = 10;
+            CATALOG[CATALOG_SIZE++] = r;
+        }
+    }
+}
+
+typedef struct {
+    int topic;
+    int difficulty;
+    double score;
+    double time_taken_min;
+} Attempt;
+
+typedef struct {
+    char name[64];
+    LearningStyle style;
+    Pace pace;
+    double skill_levels[NUM_TOPICS];
+    int current_difficulty[NUM_TOPICS];
+    Attempt history[MAX_HISTORY];
+    int history_count;
+} Student;
+
+static void create_student(Student *s, const char *name, LearningStyle style,
+                            Pace pace, const double *initial_scores) {
+    memset(s, 0, sizeof(Student));
+    strncpy(s->name, name, sizeof(s->name) - 1);
+    s->style = style;
+    s->pace = pace;
+    s->history_count = 0;
+    for (int t = 0; t < NUM_TOPICS; t++) {
+        s->skill_levels[t] = initial_scores ? initial_scores[t] : 0.0;
+        int lvl = (int)round(s->skill_levels[t] * 5);
+        s->current_difficulty[t] = lvl < 1 ? 1 : (lvl > 5 ? 5 : lvl);
+    }
+}
+
+static void record_attempt(Student *s, int topic, int difficulty,
+                            double score, double time_taken_min) {
+    if (s->history_count >= MAX_HISTORY) return;
+    Attempt *a = &s->history[s->history_count++];
+    a->topic = topic;
+    a->difficulty = difficulty;
+    a->score = score;
+    a->time_taken_min = time_taken_min;
+}
+
+typedef struct {
+    int attempts;
+    double accuracy;
+    double avg_time;
+    int trend;
+} PerfStats;
+
+static PerfStats analyze_topic(const Student *s, int topic) {
+    PerfStats stats = {0, 0.0, 0.0, 0};
+    int idx[MAX_HISTORY], n = 0;
+    for (int i = 0; i < s->history_count; i++)
+        if (s->history[i].topic == topic) idx[n++] = i;
+
+    if (n == 0) return stats;
+
+    double sum_score = 0.0, sum_time = 0.0;
+    for (int i = 0; i < n; i++) {
+        sum_score += s->history[idx[i]].score;
+        sum_time  += s->history[idx[i]].time_taken_min;
+    }
+    stats.attempts = n;
+    stats.accuracy = sum_score / n;
+    stats.avg_time = sum_time / n;
+
+    if (n >= 2) {
+        int mid = n / 2;
+        double first_avg = 0.0, second_avg = 0.0;
+        for (int i = 0; i < mid; i++) first_avg += s->history[idx[i]].score;
+        first_avg /= mid;
+        for (int i = mid; i < n; i++) second_avg += s->history[idx[i]].score;
+        second_avg /= (n - mid);
+        if (second_avg - first_avg > 0.05) stats.trend = 1;
+        else if (first_avg - second_avg > 0.05) stats.trend = -1;
+    }
+    return stats;
+}
+
+typedef struct { int topic; double gap; } GapEntry;
+
+static int compute_gaps(const Student *s, GapEntry gaps[NUM_TOPICS]) {
+    int n = 0;
+    for (int t = 0; t < NUM_TOPICS; t++) {
+        double gap = TARGET_MASTERY - s->skill_levels[t];
+        if (gap > 0) { gaps[n].topic = t; gaps[n].gap = gap; n++; }
+    }
+
+    for (int i = 0; i < n - 1; i++) {
+        int max_i = i;
+        for (int j = i + 1; j < n; j++)
+            if (gaps[j].gap > gaps[max_i].gap) max_i = j;
+        if (max_i != i) { GapEntry tmp = gaps[i]; gaps[i] = gaps[max_i]; gaps[max_i] = tmp; }
+    }
+    return n;
+}
+
+static int is_unlocked(const Student *s, int topic) {
+    for (int k = 0; k < 2; k++) {
+        int p = PREREQS[topic][k];
+        if (p == -1) continue;
+        if (s->skill_levels[p] < PREREQ_THRESHOLD) return 0;
+    }
+    return 1;
+}
+
+#define RAISE_THRESHOLD 0.85
+#define LOWER_THRESHOLD 0.50
+#define LEARNING_RATE   0.25
+
+static void adapt_after_attempt(Student *s, int topic, int difficulty, double score) {
+    double evidence = score * (0.7 + 0.3 * (difficulty / 5.0));
+    double old = s->skill_levels[topic];
+    double updated = old + LEARNING_RATE * (evidence - old);
+    if (updated < 0.0) updated = 0.0;
+    if (updated > 1.0) updated = 1.0;
+    s->skill_levels[topic] = updated;
+
+    int cur = s->current_difficulty[topic];
+    if (score >= RAISE_THRESHOLD) {
+        s->current_difficulty[topic] = cur < 5 ? cur + 1 : 5;
+    } else if (score < LOWER_THRESHOLD) {
+        s->current_difficulty[topic] = cur > 1 ? cur - 1 : 1;
+    }
+
+}
+
+static double pace_multiplier(Pace pace) {
+    switch (pace) {
+        case PACE_SLOW:   return 0.7;
+        case PACE_FAST:   return 1.4;
+        default:          return 1.0;
+    }
+}
+
+static double score_resource(const Resource *r, const Student *s, int target_difficulty) {
+    double score = 0.0;
+    score += 3.0 - fabs((double)(r->difficulty - target_difficulty));
+    if (r->style == s->style) score += 2.0;
+    else if (r->style == STYLE_ANY) score += 0.5;
+    return score;
+}
+
+static int recommend_resources(const Student *s, int topic, Resource out[MAX_RES_PER_STEP], int max_n) {
+
+    static Resource candidates[MAX_RESOURCES];
+    int n = 0;
+    for (int i = 0; i < CATALOG_SIZE; i++)
+        if (CATALOG[i].topic == topic && CATALOG[i].r_type != TYPE_QUIZ)
+            candidates[n++] = CATALOG[i];
+
+    int target_difficulty = s->current_difficulty[topic];
+
+    int limit = n < max_n ? n : max_n;
+    for (int i = 0; i < limit; i++) {
+        int best = i;
+        double best_score = score_resource(&candidates[i], s, target_difficulty);
+        for (int j = i + 1; j < n; j++) {
+            double sc = score_resource(&candidates[j], s, target_difficulty);
+            if (sc > best_score) { best_score = sc; best = j; }
+        }
+        Resource tmp = candidates[i]; candidates[i] = candidates[best]; candidates[best] = tmp;
+        out[i] = candidates[i];
+    }
+    return limit;
+}
+
+typedef struct {
+    int topic;
+    int difficulty;
+    double gap;
+    Resource resources[MAX_RES_PER_STEP];
+    int resource_count;
+} PathStep;
+
+static int generate_path(const Student *s, PathStep path[MAX_PATH_STEPS]) {
+    GapEntry gaps[NUM_TOPICS];
+    int n_gaps = compute_gaps(s, gaps);
+
+    int max_topics = MAX_PATH_STEPS;
+    int n_topics = (int)round(max_topics * pace_multiplier(s->pace));
+    if (n_topics < 1) n_topics = 1;
+    if (n_topics > MAX_PATH_STEPS) n_topics = MAX_PATH_STEPS;
+
+    int steps = 0;
+    for (int i = 0; i < n_gaps && steps < n_topics; i++) {
+        int topic = gaps[i].topic;
+        if (!is_unlocked(s, topic)) continue;
+        PathStep *step = &path[steps];
+        step->topic = topic;
+        step->difficulty = s->current_difficulty[topic];
+        step->gap = gaps[i].gap;
+        step->resource_count = recommend_resources(s, topic, step->resources, MAX_RES_PER_STEP);
+        steps++;
+    }
+    return steps;
+}
+
+static void print_path(const Student *s, PathStep path[MAX_PATH_STEPS], int n_steps) {
+    for (int i = 0; i < n_steps; i++) {
+        PathStep *step = &path[i];
+        printf("  Step %d: %-16s (difficulty %d/5)\n", i + 1,
+               TOPIC_NAMES[step->topic], step->difficulty);
+        printf("    Why: skill gap of %.0f%% vs target; prerequisites met; "
+               "matched to '%s' learning style.\n",
+               step->gap * 100.0, STYLE_NAMES[s->style]);
+        for (int j = 0; j < step->resource_count; j++) {
+            Resource *r = &step->resources[j];
+            printf("    -> [%s] R%04d | style=%s | difficulty=%d | %d min\n",
+                   TYPE_NAMES[r->r_type], r->id, STYLE_NAMES[r->style],
+                   r->difficulty, r->duration_min);
+        }
+    }
+}
+
+static const char *topic_status(const Student *s, int topic) {
+    double level = s->skill_levels[topic];
+    if (level >= TARGET_MASTERY) return "Mastered";
+    if (level >= 0.5)            return "In Progress";
+    if (level > 0.0)             return "Started";
+    return "Not Started";
+}
+
+static void print_progress_report(const Student *s) {
+    double total = 0.0;
+    int mastered = 0;
+    for (int t = 0; t < NUM_TOPICS; t++) {
+        total += s->skill_levels[t];
+        if (s->skill_levels[t] >= TARGET_MASTERY) mastered++;
+    }
+    printf("  Overall progress: %.0f%%  (%d/%d topics mastered)\n",
+           (total / NUM_TOPICS) * 100.0, mastered, NUM_TOPICS);
+    for (int t = 0; t < NUM_TOPICS; t++) {
+        printf("    %-16s mastery=%.2f  status=%-12s difficulty_lvl=%d\n",
+               TOPIC_NAMES[t], s->skill_levels[t], topic_status(s, t),
+               s->current_difficulty[t]);
+    }
+}
+
+static double rand_uniform(double lo, double hi) {
+    return lo + (hi - lo) * ((double)rand() / RAND_MAX);
+}
+
+static double simulated_score(double base_mastery) {
+    double u1 = ((double)rand() / RAND_MAX);
+    double u2 = ((double)rand() / RAND_MAX);
+    if (u1 < 1e-9) u1 = 1e-9;
+    double z = sqrt(-2.0 * log(u1)) * cos(2.0 * M_PI * u2);
+    double score = base_mastery + 0.35 + z * 0.15;
+    if (score < 0.0) score = 0.0;
+    if (score > 1.0) score = 1.0;
+    return score;
+}
+
+static void simulate_session(Student *s, int rounds) {
+    for (int r = 0; r < rounds; r++) {
+        PathStep path[MAX_PATH_STEPS];
+        int n_steps = generate_path(s, path);
+        if (n_steps == 0) {
+            printf("  All topics mastered or none unlocked yet!\n");
+            break;
+        }
+        int topic = path[0].topic;
+        int difficulty = s->current_difficulty[topic];
+        double score = simulated_score(s->skill_levels[topic]);
+        double time_taken = rand_uniform(5.0, 20.0);
+
+        record_attempt(s, topic, difficulty, score, time_taken);
+        adapt_after_attempt(s, topic, difficulty, score);
+
+        printf("  Round %d: attempted '%s' at difficulty %d -> score %.2f\n",
+               r + 1, TOPIC_NAMES[topic], difficulty, score);
+    }
+}
+
+static void run_student_demo(Student *s) {
+    printf("======================================================================\n");
+    printf("STUDENT PROFILE: %s (style=%s, pace=%s)\n", s->name,
+           STYLE_NAMES[s->style],
+           s->pace == PACE_SLOW ? "slow" : (s->pace == PACE_FAST ? "fast" : "medium"));
+    printf("----------------------------------------------------------------------\n");
+
+    printf("Initial skill-gap analysis:\n");
+    GapEntry gaps[NUM_TOPICS];
+    int n_gaps = compute_gaps(s, gaps);
+    for (int i = 0; i < n_gaps && i < 5; i++)
+        printf("  %-16s gap=%.0f%%\n", TOPIC_NAMES[gaps[i].topic], gaps[i].gap * 100.0);
+
+    printf("\nInitial personalized learning path:\n");
+    PathStep path[MAX_PATH_STEPS];
+    int n_steps = generate_path(s, path);
+    print_path(s, path, n_steps);
+
+    printf("\nSimulating learning sessions (attempt -> adapt -> re-recommend):\n");
+    simulate_session(s, 5);
+
+    printf("\nPerformance analysis after sessions:\n");
+    for (int t = 0; t < NUM_TOPICS; t++) {
+        PerfStats stats = analyze_topic(s, t);
+        if (stats.attempts > 0)
+            printf("  %-16s attempts=%d accuracy=%.3f trend=%+d\n",
+                   TOPIC_NAMES[t], stats.attempts, stats.accuracy, stats.trend);
+    }
+
+    printf("\nUpdated learning path:\n");
+    n_steps = generate_path(s, path);
+    print_path(s, path, n_steps);
+
+    printf("\nProgress report:\n");
+    print_progress_report(s);
+    printf("\n");
+}
+
+int main(void) {
+    srand(42);
+    build_catalog();
+
+    double alice_scores[NUM_TOPICS] = {0.8, 0.3, 0.0, 0.0, 0.5, 0.0, 0.0};
+    Student alice;
+    create_student(&alice, "Alice", STYLE_VISUAL, PACE_FAST, alice_scores);
+
+    double ben_scores[NUM_TOPICS] = {0.4, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+    Student ben;
+    create_student(&ben, "Ben", STYLE_READING, PACE_SLOW, ben_scores);
+
+    run_student_demo(&alice);
+    run_student_demo(&ben);
+
+    return 0;
+}
